@@ -1,121 +1,91 @@
-import { normalize } from './matcherHelpers';
+import { normalize, toMs, toTimeOnly, groupInbounds, getEdCycles, buildRow } from './matcherHelpers';
 import { buildDockingMaps } from './buildDockingMaps';
 import { buildInboundMap } from './buildInboundMap';
 import { levenshteinScore } from './levenshtein';
-import { collectNoMatchTMS, collectNoMatchED } from './collectNoMatch';
-import { runTimeMatch } from './timeMatch';
-import { toMs, toTimeOnly, groupInbounds, getEdCycles, buildRow } from './matcherHelpers';
+import { buildBSTIndex } from './bst';
+import { bubbleSortCandidates } from './bubbleSort';
+import { TIME_WINDOW_MS } from './matcherConstants';
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function isAnagram(a, b) {
   if (a.length !== b.length) return false;
   return a.split('').sort().join('') === b.split('').sort().join('');
 }
 
-export function matchData(tmsRows, dockingRows) {
-  const { dockingByPatente, dockingAllByPatente, keySiblings } = buildDockingMaps(dockingRows);
-  const inboundMap = buildInboundMap(tmsRows);
+const STOP_WORDS = new Set([
+  'sa', 'srl', 'sl', 'de', 'la', 'el', 'los', 'las', 'y', 'e', 'del',
+  'transporte', 'transportes', 'logistica', 'logistics', 'cargo', 'express', 'group',
+]);
 
-  console.log('=== INICIO MATCHING ===');
-  console.log('Total TMS trucks:', Object.keys(inboundMap).length);
-  console.log('Total ED keys:', Object.keys(dockingByPatente).length);
+function normalizeCarrier(s) {
+  return (s || '').toLowerCase()
+    .replace(/[^a-z0-9\s]/g, '')
+    .split(/\s+/)
+    .filter(w => w && !STOP_WORDS.has(w))
+    .sort()
+    .join(' ');
+}
 
-  // Crear IDs únicos para cada patente
-  const tmsPatentes = Object.keys(inboundMap).map((truckId, idx) => ({
-    id: `TMS_${idx}`,
-    truckId,
-    normalized: normalize(truckId),
-    used: false
-  }));
+function carriersMatch(carrierTMS, transporteED) {
+  const a = normalizeCarrier(carrierTMS);
+  const b = normalizeCarrier(transporteED);
+  if (!a || !b) return true;
+  const wordsA = new Set(a.split(' '));
+  return b.split(' ').some(w => wordsA.has(w));
+}
 
-  const edPatentes = Object.keys(dockingByPatente).map((key, idx) => ({
-    id: `ED_${idx}`,
-    key,
-    normalized: key,
-    used: false
-  }));
+// Score de una patente TMS contra una key ED (que puede ser un semi con múltiples partes).
+// Compara contra cada parte y retorna el score más alto junto con el tipo de match.
+function scoreAgainstED(tmsNorm, edParts) {
+  let bestScore = 0;
+  let bestType = null;
 
-  // Evaluar TODAS las combinaciones posibles
-  const allCandidates = [];
-  
-  for (const tms of tmsPatentes) {
-    for (const ed of edPatentes) {
-      let matchType = null;
-      let score = 0;
+  for (const part of edParts) {
+    // Exact
+    if (tmsNorm === part) return { score: 1.0, matchType: 'exact' };
 
-      // 1. Exact match
-      if (tms.normalized === ed.normalized) {
-        matchType = 'exact';
-        score = 1.0;
-      }
-      // 2. Anagram match
-      else if (isAnagram(tms.normalized, ed.normalized)) {
-        matchType = 'anagram';
-        score = 0.95;
-      }
-      // 3. Fuzzy match
-      else {
-        const fuzzyScore = levenshteinScore(tms.normalized, ed.normalized);
-        if (fuzzyScore >= 0.5) {
-          matchType = fuzzyScore >= 0.8 ? 'fuzzy-high' : 'fuzzy-low';
-          score = fuzzyScore;
-        }
-      }
-
-      if (matchType) {
-        allCandidates.push({
-          tmsId: tms.id,
-          edId: ed.id,
-          truckId: tms.truckId,
-          edKey: ed.key,
-          matchType,
-          score
-        });
-      }
-    }
-  }
-
-  // Ordenar por score descendente
-  allCandidates.sort((a, b) => b.score - a.score);
-
-  console.log('Total candidates:', allCandidates.length);
-
-  // Seleccionar los mejores matches sin reutilizar
-  const usedTMS = new Set();
-  const usedED = new Set();
-  const selectedMatches = [];
-
-  for (const candidate of allCandidates) {
-    if (usedTMS.has(candidate.tmsId) || usedED.has(candidate.edId)) {
+    // Anagram
+    if (isAnagram(tmsNorm, part)) {
+      if (0.95 > bestScore) { bestScore = 0.95; bestType = 'anagram'; }
       continue;
     }
 
-    usedTMS.add(candidate.tmsId);
-    usedED.add(candidate.edId);
-    
-    // Marcar también los siblings (semis con múltiples patentes)
-    if (keySiblings[candidate.edKey]) {
-      keySiblings[candidate.edKey].forEach(siblingKey => {
-        const siblingED = edPatentes.find(e => e.key === siblingKey);
-        if (siblingED) {
-          usedED.add(siblingED.id);
-        }
-      });
+    // Levenshtein — umbral 0.3 para capturar patentes con varios caracteres distintos
+    const lev = levenshteinScore(tmsNorm, part);
+    if (lev >= 0.3 && lev > bestScore) {
+      bestScore = lev;
+      bestType = lev >= 0.8 ? 'fuzzy-high' : 'fuzzy-low';
     }
-    
-    selectedMatches.push(candidate);
   }
 
-  console.log('Selected matches:', selectedMatches.length);
+  return bestScore > 0 ? { score: bestScore, matchType: bestType } : null;
+}
 
-  // Construir resultados finales
+function scoreMultiCriteria(tmsData, edRow, edAllRows) {
+  const cantPaquetes = Number(edRow['CANT PAQUETES']);
+  if (isNaN(cantPaquetes) || cantPaquetes !== tmsData.totalShipments) return 0;
+
+  const callRow = edAllRows.find(r => (r['Accion'] || '').trim().toLowerCase() === 'call');
+  let horarioScore = 0;
+  if (callRow && tmsData.openedMs !== null) {
+    const callMs = toMs(callRow['Fecha y hora']);
+    if (callMs !== null && callMs <= tmsData.openedMs) {
+      const diff = tmsData.openedMs - callMs;
+      if (diff <= TIME_WINDOW_MS) horarioScore = 1 - diff / TIME_WINDOW_MS;
+    }
+  }
+  const transportistaScore = carriersMatch(tmsData.carrier, edRow['TRANSPORTE'] || '') ? 1 : 0;
+  return horarioScore * 0.6 + transportistaScore * 0.4;
+}
+
+// ─── Construir filas de resultado para un conjunto de matches ─────────────────
+
+function buildMatchResults(selectedMatches, inboundMap, dockingByPatente, dockingAllByPatente, processedInboundIds) {
   const results = [];
-  const processedInboundIds = new Set();
-  const matchedTMSPatentes = new Map(); // Para debugging
 
   for (const match of selectedMatches) {
-    const truckId = match.truckId;
-    const edKey = match.edKey;
-
+    const { truckId, edKey, matchType, score } = match;
     const dockingMatchRows = dockingAllByPatente[edKey] || [];
     const matchedPatente = dockingByPatente[edKey][0]['PATENTE'].trim();
     const rowConUnidad = dockingMatchRows.find(r => (r['TIPO DE VEHICULO'] || '').trim());
@@ -133,8 +103,6 @@ export function matchData(tmsRows, dockingRows) {
 
     const edCycles = getEdCycles(dockingMatchRows);
     const usedCycles = new Set();
-    
-    let groupsMatched = 0;
 
     for (const group of groupInbounds(inboundList)) {
       if (group.inboundIds.every(id => processedInboundIds.has(id))) continue;
@@ -153,106 +121,256 @@ export function matchData(tmsRows, dockingRows) {
         });
       }
 
-      if (matchedCycleIdx === -1) {
-        // Sin ciclo ED, usar datos aproximados
+      let arribo = '', call = '';
+      if (matchedCycleIdx !== -1) {
+        usedCycles.add(matchedCycleIdx);
+        const cycle = edCycles[matchedCycleIdx];
+        const addRow = cycle.find(r => (r['Accion'] || '').trim().toLowerCase() === 'add');
+        const callRow = cycle.find(r => (r['Accion'] || '').trim().toLowerCase() === 'call');
+        arribo = addRow?.['Fecha y hora'] || '';
+        call = toTimeOnly(callRow?.['Fecha y hora'] || '');
+      } else {
         const addRow = dockingMatchRows.find(r => (r['Accion'] || '').trim().toLowerCase() === 'add');
         const callRow = dockingMatchRows.find(r => (r['Accion'] || '').trim().toLowerCase() === 'call');
-        
-        group.inboundIds.forEach(id => processedInboundIds.add(id));
-        results.push(buildRow(
-          truckId, group, unidad,
-          addRow?.['Fecha y hora'] || '',
-          toTimeOnly(callRow?.['Fecha y hora'] || ''),
-          matchedPatente, match.matchType, match.score
-        ));
-        groupsMatched++;
+        arribo = addRow?.['Fecha y hora'] || '';
+        call = toTimeOnly(callRow?.['Fecha y hora'] || '');
+      }
+
+      group.inboundIds.forEach(id => processedInboundIds.add(id));
+      results.push(buildRow(truckId, group, unidad, arribo, call, matchedPatente, matchType, score));
+    }
+  }
+
+  return results;
+}
+
+// ─── Pipeline principal ───────────────────────────────────────────────────────
+
+export function matchData(tmsRows, dockingRows) {
+  const { dockingByPatente, dockingAllByPatente, edKeyParts, keySiblings } = buildDockingMaps(dockingRows);
+  const inboundMap = buildInboundMap(tmsRows);
+
+  console.log('=== ADVANCED MATCHING ENGINE ===');
+  console.log('TMS trucks:', Object.keys(inboundMap).length);
+  console.log('ED keys:', Object.keys(dockingByPatente).length);
+
+  const edKeys = Object.keys(dockingByPatente);
+
+  // BST indexa cada parte individual de cada key ED.
+  // Así "AH912KR;AF608EL" permite encontrar exacto por "AH912KR" o "AF608EL".
+  // El mapa partToKey permite recuperar la key ED completa desde la parte.
+  const partToKey = new Map();
+  for (const key of edKeys) {
+    for (const part of (edKeyParts[key] || [key])) {
+      if (!partToKey.has(part)) partToKey.set(part, key);
+    }
+  }
+  const bstIndex = buildBSTIndex([...partToKey.keys()]);
+
+  const tmsEntries = Object.keys(inboundMap).map((truckId, idx) => {
+    const inbounds = inboundMap[truckId];
+    const firstInbound = Object.values(inbounds)[0];
+    return {
+      id: `TMS_${idx}`,
+      truckId,
+      normalized: normalize(truckId),
+      totalShipments: Object.values(inbounds).reduce((s, d) => s + d.shipments.size, 0),
+      openedMs: toMs(firstInbound?.openedStr),
+      carrier: firstInbound?.carrier || '',
+    };
+  });
+
+  const edEntries = edKeys.map((key, idx) => ({ id: `ED_${idx}`, key }));
+
+  // ── FASE 1: Exact match via BST (score 1.0) — intocable ──────────────────
+  const exactMatches = [];
+  const usedTMS = new Set();
+  const usedED = new Set();
+
+  for (const tms of tmsEntries) {
+    const hit = bstIndex.search(tms.normalized);
+    if (!hit) continue;
+    const edKey = partToKey.get(hit);
+    if (!edKey) continue;
+    const ed = edEntries.find(e => e.key === edKey);
+    if (!ed || usedED.has(ed.id)) continue;
+
+    usedTMS.add(tms.id);
+    usedED.add(ed.id);
+    if (keySiblings[ed.key]) {
+      keySiblings[ed.key].forEach(sibKey => {
+        const sib = edEntries.find(e => e.key === sibKey);
+        if (sib) usedED.add(sib.id);
+      });
+    }
+    exactMatches.push({ tmsId: tms.id, edId: ed.id, truckId: tms.truckId, edKey: ed.key, matchType: 'exact', score: 1.0 });
+  }
+
+  console.log('Exact matches:', exactMatches.length);
+
+  // ── FASE 2: Todos los algoritmos sobre los residuos ───────────────────────
+  // TMS y ED que NO matchearon exacto entran al pool multi-algoritmo
+  const residualTMS = tmsEntries.filter(t => !usedTMS.has(t.id));
+  const residualED = edEntries.filter(e => !usedED.has(e.id));
+
+  const allCandidates = [];
+
+  for (const tms of residualTMS) {
+    for (const ed of residualED) {
+      const parts = edKeyParts[ed.key] || [ed.key];
+
+      // Exact via partes (por si el BST no lo capturó)
+      if (parts.includes(tms.normalized)) {
+        allCandidates.push({ tmsId: tms.id, edId: ed.id, truckId: tms.truckId, edKey: ed.key, matchType: 'exact', score: 1.0 });
         continue;
       }
 
-      usedCycles.add(matchedCycleIdx);
-      const cycle = edCycles[matchedCycleIdx];
-      const addRow = cycle.find(r => (r['Accion'] || '').trim().toLowerCase() === 'add');
-      const callRow = cycle.find(r => (r['Accion'] || '').trim().toLowerCase() === 'call');
+      // Anagram + Levenshtein contra cada parte
+      const result = scoreAgainstED(tms.normalized, parts);
+      if (result) {
+        allCandidates.push({ tmsId: tms.id, edId: ed.id, truckId: tms.truckId, edKey: ed.key, ...result });
+        continue;
+      }
 
-      group.inboundIds.forEach(id => processedInboundIds.add(id));
-      results.push(buildRow(
-        truckId, group, unidad,
-        addRow?.['Fecha y hora'] || '',
-        toTimeOnly(callRow?.['Fecha y hora'] || ''),
-        matchedPatente, match.matchType, match.score
-      ));
-      groupsMatched++;
+      // Multi-criteria: piezas + horario + transportista (score > 0)
+      const mcScore = scoreMultiCriteria(
+        { totalShipments: tms.totalShipments, openedMs: tms.openedMs, carrier: tms.carrier },
+        dockingByPatente[ed.key][0],
+        dockingAllByPatente[ed.key] || []
+      );
+      if (mcScore > 0) {
+        allCandidates.push({ tmsId: tms.id, edId: ed.id, truckId: tms.truckId, edKey: ed.key, matchType: 'multi-criteria', score: mcScore });
+      }
     }
-    
-    // Tracking para debugging
-    if (!matchedTMSPatentes.has(truckId)) {
-      matchedTMSPatentes.set(truckId, []);
-    }
-    matchedTMSPatentes.get(truckId).push({ edKey, groups: groupsMatched });
-  }
-  
-  // Log patentes TMS que matchearon múltiples veces
-  const duplicateTMS = [];
-  for (const [truckId, matches] of matchedTMSPatentes.entries()) {
-    if (matches.length > 1) {
-      duplicateTMS.push({ truckId, matches });
-    }
-  }
-  
-  if (duplicateTMS.length > 0) {
-    console.warn('PATENTES TMS QUE MATCHEARON MÚLTIPLES VECES:', duplicateTMS);
   }
 
-  // Marcar las claves ED usadas para collectNoMatch (incluyendo siblings)
+  // Bubble Sort por score descendente
+  bubbleSortCandidates(allCandidates);
+  console.log('Candidatos residuales:', allCandidates.length);
+
+  // Greedy selection sobre residuos
+  const residualMatches = [];
+  for (const candidate of allCandidates) {
+    if (usedTMS.has(candidate.tmsId) || usedED.has(candidate.edId)) continue;
+    usedTMS.add(candidate.tmsId);
+    usedED.add(candidate.edId);
+    if (keySiblings[candidate.edKey]) {
+      keySiblings[candidate.edKey].forEach(sibKey => {
+        const sib = edEntries.find(e => e.key === sibKey);
+        if (sib) usedED.add(sib.id);
+      });
+    }
+    residualMatches.push(candidate);
+  }
+
+  console.log('Residual matches:', residualMatches.length);
+
+  const allSelectedMatches = [...exactMatches, ...residualMatches];
+
+  // ── Construir filas de resultado ──────────────────────────────────────────
+  const processedInboundIds = new Set();
+  const matched = buildMatchResults(allSelectedMatches, inboundMap, dockingByPatente, dockingAllByPatente, processedInboundIds);
+
+  // Claves ED usadas
   const usedDockingKeys = new Set();
-  for (const match of selectedMatches) {
+  for (const match of allSelectedMatches) {
     usedDockingKeys.add(match.edKey);
-    if (keySiblings[match.edKey]) {
-      keySiblings[match.edKey].forEach(k => usedDockingKeys.add(k));
+    if (keySiblings[match.edKey]) keySiblings[match.edKey].forEach(k => usedDockingKeys.add(k));
+  }
+
+  // ── FASE 3: Time-window match sobre los residuos finales ──────────────────
+  // Se ejecuta sobre lo que quedó sin match y SÍ descuenta de noMatch
+  const usedEDForTime = new Set();
+  const timeMatches = [];
+  const processedByTime = new Set(); // inboundIds resueltos por timeMatch
+
+  // Construir lista de TMS sin match (inbounds no procesados)
+  const noMatchTMSRaw = [];
+  for (const [truckId, inbounds] of Object.entries(inboundMap)) {
+    const unprocessed = Object.entries(inbounds).filter(([id]) => !processedInboundIds.has(id));
+    if (unprocessed.length === 0) continue;
+    const totalShipments = unprocessed.reduce((s, [, d]) => s + d.shipments.size, 0);
+    const firstInbound = unprocessed[0][1];
+    noMatchTMSRaw.push({
+      patente: truckId,
+      inboundId: unprocessed.map(([id]) => id).join(', '),
+      inboundIds: unprocessed.map(([id]) => id),
+      carrier: firstInbound.carrier || '',
+      shipments: totalShipments,
+      inicioIBTMS: toTimeOnly(firstInbound.openedStr),
+      finIBTMS: toTimeOnly(unprocessed[unprocessed.length - 1][1].closedStr),
+      openedStr: firstInbound.openedStr,
+    });
+  }
+
+  for (const tmsRow of noMatchTMSRaw) {
+    const tmsOpenedMs = toMs(tmsRow.openedStr);
+    if (tmsOpenedMs === null) continue;
+
+    let bestDiff = Infinity, bestEDKey = null;
+    for (const edKey of edKeys) {
+      if (usedDockingKeys.has(edKey) || usedEDForTime.has(edKey)) continue;
+      const callRow = (dockingAllByPatente[edKey] || []).find(r => (r['Accion'] || '').trim().toLowerCase() === 'call');
+      if (!callRow) continue;
+      const callMs = toMs(callRow['Fecha y hora']);
+      if (callMs === null || callMs > tmsOpenedMs) continue;
+      const diff = tmsOpenedMs - callMs;
+      if (diff > TIME_WINDOW_MS) continue;
+      if (diff < bestDiff) { bestDiff = diff; bestEDKey = edKey; }
     }
+
+    if (!bestEDKey) continue;
+
+    // Este TMS matcheó por tiempo → se descuenta de noMatch
+    usedEDForTime.add(bestEDKey);
+    usedDockingKeys.add(bestEDKey);
+    tmsRow.inboundIds.forEach(id => processedByTime.add(id));
+
+    const edRow = dockingByPatente[bestEDKey][0];
+    const callRow = (dockingAllByPatente[bestEDKey] || []).find(r => (r['Accion'] || '').trim().toLowerCase() === 'call');
+    timeMatches.push({
+      patenteTMS: tmsRow.patente,
+      inboundId: tmsRow.inboundId,
+      patenteED: edRow['PATENTE'],
+      carrier: tmsRow.carrier,
+      unidad: (edRow['TIPO DE VEHICULO'] || '').trim(),
+      callED: toTimeOnly(callRow?.['Fecha y hora'] || ''),
+      inicioIBTMS: tmsRow.inicioIBTMS,
+      finIBTMS: tmsRow.finIBTMS,
+      totalShipments: tmsRow.shipments,
+      cantPaquetesED: edRow['CANT PAQUETES'],
+      diffMinutos: Math.round(bestDiff / 60000),
+    });
   }
 
-  const noMatchTMS = collectNoMatchTMS(inboundMap, processedInboundIds);
-  const noMatchED = collectNoMatchED(dockingByPatente, usedDockingKeys, dockingAllByPatente, keySiblings);
-  
-  console.log('\n=== TMS SIN MATCH DETALLADO ===');
-  noMatchTMS.forEach(r => {
-    console.log(`${r.patente}: ${r.shipments} piezas, carrier: ${r.carrier}, inicio: ${r.inicioIBTMS}`);
-  });
-  
-  console.log('\n=== ED SIN MATCH DETALLADO ===');
-  noMatchED.forEach(r => {
-    console.log(`${r.patente}: ${r.cantPaquetes} piezas, transporte: ${r.transporte}, arribo: ${r.arribo}`);
-  });
+  // ── noMatch final: excluye lo resuelto por timeMatch ─────────────────────
+  const allProcessed = new Set([...processedInboundIds, ...processedByTime]);
 
-  console.log('\n=== RESULTADOS FINALES ===');
-  console.log('Total matched:', results.length);
-  console.log('TMS: 351 trucks, matched:', selectedMatches.length, ', sin match:', 351 - selectedMatches.length);
-  console.log('ED: 370 keys, matched:', usedDockingKeys.size, ', sin match:', 370 - usedDockingKeys.size);
-  console.log('Sin match TMS (patentes únicas):', noMatchTMS.length);
-  console.log('Sin match ED (patentes únicas):', noMatchED.length);
-  
-  // Debugging: buscar patentes TMS con muchas piezas
-  const highShipmentMatches = results.filter(r => r.totalShipments > 4000);
-  if (highShipmentMatches.length > 0) {
-    console.log('MATCHES CON MÁS DE 4000 PIEZAS:', highShipmentMatches.map(r => ({
-      patenteTMS: r.patenteTMS,
-      patenteED: r.matchedPatente,
-      piezas: r.totalShipments,
-      matchType: r.matchType,
-      score: r.score
-    })));
-  }
-  
-  // Debugging: ver qué claves ED no están en noMatchED
-  const edKeysNotMatched = Object.keys(dockingByPatente).filter(k => !usedDockingKeys.has(k));
-  console.log('ED keys sin match (raw):', edKeysNotMatched.length);
-  if (edKeysNotMatched.length !== noMatchED.length) {
-    console.warn('DISCREPANCIA: ED keys sin match raw vs filtered:', edKeysNotMatched.length, 'vs', noMatchED.length);
-    console.warn('Diferencia:', edKeysNotMatched.length - noMatchED.length, 'patentes filtradas');
+  const noMatchTMS = noMatchTMSRaw.filter(r => r.inboundIds.some(id => !allProcessed.has(id)));
+
+  // noMatch ED: excluye claves usadas en exact+residual+time
+  const processedEDKeys = new Set();
+  const noMatchED = [];
+  for (const key of edKeys) {
+    if (usedDockingKeys.has(key) || processedEDKeys.has(key)) continue;
+    processedEDKeys.add(key);
+    if (keySiblings[key]) keySiblings[key].forEach(k => processedEDKeys.add(k));
+    const allRows = dockingAllByPatente[key] || [];
+    const addRow = allRows.find(r => (r['Accion'] || '').trim().toLowerCase() === 'add');
+    const callRow = allRows.find(r => (r['Accion'] || '').trim().toLowerCase() === 'call');
+    const firstRow = dockingByPatente[key][0];
+    noMatchED.push({
+      patente: firstRow['PATENTE'],
+      cantPaquetes: firstRow['CANT PAQUETES'],
+      unidad: (firstRow['TIPO DE VEHICULO'] || '').trim(),
+      transporte: firstRow['TRANSPORTE'] || '',
+      arribo: addRow ? addRow['Fecha y hora'] : '',
+      call: callRow ? callRow['Fecha y hora'] : '',
+    });
   }
 
-  const timeMatches = runTimeMatch(noMatchTMS, dockingByPatente, dockingAllByPatente, usedDockingKeys);
+  console.log('=== RESULTADOS ===');
+  console.log('Matched:', matched.length, '| Time matches:', timeMatches.length, '| NoMatch TMS:', noMatchTMS.length, '| NoMatch ED:', noMatchED.length);
 
-  return { matched: results, noMatchTMS, noMatchED, timeMatches };
+  return { matched, noMatchTMS, noMatchED, timeMatches };
 }
